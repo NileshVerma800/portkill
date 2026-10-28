@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# portkill - find what is using a port and stop it, in one command.
+# Merges two commands: lsof (find the process) + kill (stop it).
+
+VERSION="1.0"
+
+usage() {
+  cat <<EOF
+Usage: portkill [options] <port>
+
+Find the process listening on <port> and stop it.
+
+Options:
+  -h, --help       Show this help and exit
+  -n, --dry-run    Show what would be killed, change nothing
+  -y, --yes        Do not ask for confirmation
+  -f, --force      Use SIGKILL (kill -9) instead of SIGTERM
+  -V, --version    Show version and exit
+
+Exit codes:
+  0  success (or dry run / cancelled)
+  1  nothing is listening on that port
+  2  wrong usage / invalid port
+  3  could not kill the process (permission denied?)
+  4  lsof is not installed
+EOF
+}
+
+DRY=0; YES=0; SIG="TERM"; PORT=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)    usage; exit 0 ;;
+    -V|--version) echo "portkill $VERSION"; exit 0 ;;
+    -n|--dry-run) DRY=1 ;;
+    -y|--yes)     YES=1 ;;
+    -f|--force)   SIG="KILL" ;;
+    -*)           echo "portkill: unknown option '$1'" >&2
+                  echo "Try 'portkill --help' for more information." >&2
+                  exit 2 ;;
+    *)            PORT="$1" ;;
+  esac
+  shift
+done
+
+# --- validate input ---
+if [ -z "$PORT" ]; then
+  echo "portkill: missing port number" >&2
+  echo "Try 'portkill --help' for more information." >&2
+  exit 2
+fi
+case "$PORT" in
+  *[!0-9]*) echo "portkill: '$PORT' is not a valid port number" >&2; exit 2 ;;
+esac
+if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+  echo "portkill: port must be between 1 and 65535" >&2
+  exit 2
+fi
+
+if ! command -v lsof >/dev/null 2>&1; then
+  echo "portkill: 'lsof' is not installed. Install it with: sudo apt install lsof" >&2
+  exit 4
+fi
+
+# --- step 1: lsof -> find PIDs listening on the port ---
+PIDS=$(lsof -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | sort -u)
+
+if [ -z "$PIDS" ]; then
+  echo "Nothing is listening on port $PORT."
+  exit 1
+fi
+
+echo "Port $PORT is in use by:"
+for pid in $PIDS; do
+  name=$(ps -p "$pid" -o comm= 2>/dev/null)
+  owner=$(ps -p "$pid" -o user= 2>/dev/null)
+  printf "  PID %-8s %-18s user: %s\n" "$pid" "$name" "$owner"
+done
+
+if [ "$DRY" -eq 1 ]; then
+  echo "[dry-run] Would send SIG$SIG to: $(echo $PIDS)"
+  exit 0
+fi
+
+if [ "$YES" -ne 1 ]; then
+  printf "Kill these process(es)? [y/N] "
+  read -r answer
+  case "$answer" in
+    y|Y|yes|YES) ;;
+    *) echo "Cancelled. Nothing was killed."; exit 0 ;;
+  esac
+fi
+
+# --- step 2: kill -> stop them ---
+if ! kill -s "$SIG" $PIDS 2>/dev/null; then
+  echo "portkill: could not kill process(es) $(echo $PIDS). Try: sudo portkill $PORT" >&2
+  exit 3
+fi
+
+# wait up to ~2 seconds for the port to be released
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  lsof -t -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
+  sleep 0.2
+done
+
+if lsof -t -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "Signal sent, but port $PORT is still busy. Try again with --force." >&2
+  exit 3
+fi
+
+echo "Done. Port $PORT is now free."
+exit 0
